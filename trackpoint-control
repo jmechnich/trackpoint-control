@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8; mode: python -*-
+import argparse, os, re, sip, subprocess, sys
+from enum import IntEnum
+
+from PyQt5.Qt import *
+
+def which(program):
+    """find executable in $PATH, return path to file if found, None otherwise"""
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+    fpath, fname = os.path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            path = path.strip('"')
+            exe_file = os.path.join(path, program)
+            if is_exe(exe_file):
+                return exe_file
+
+    return None
+
+class TrackpointControl(QWidget):
+    update_interval = 2000
+    basepath     = '/sys/devices/platform/i8042'
+    suidhelper   = which('trackpoint-control-helper')
+    msgtimeout   = 2000
+    parameters   = [
+        # filename       description   default value
+        ('sensitivity', "Sensitivity", 128),
+        ('speed',       "Speed of TP Cursor", 97),
+        ('inertia',     "Negative Inertia", 6),
+        ('reach',       "Backup for Z-axis press", 10),
+        ('draghys',     "Drag Hysteresis (how hard it is to drag with Z-axis pressed)", 255),
+        ('mindrag',     "Minimum amount of force needed to trigger dragging", 20),
+        ('thresh',      "Minimum value for a Z-axis press", 8),
+        ('upthresh',    "Used to generate a 'click' on Z-axis", 255),
+        ('ztime',       "How sharp of a press", 38),
+        ('jenks',       "Minimum curvature for double click", 135),
+        ('drift_time',  "How long a 'hands off' condition must last (x*107ms) for drift correction to occur", 5),
+    ]
+    switches = [ 
+        ('press_to_select', "Press to Select", 0),
+        ('skipback',        "Suppress movement after drag release", 0),
+        ('ext_dev',         "Disable external device", 0),
+    ]
+    def __init__(self,parent=None):
+        super(TrackpointControl,self).__init__(parent)
+        self.systray = None
+        self.layout = QVBoxLayout()
+        self.trackpoints = self.find_all()
+        self.timer = QTimer()
+        self.timer.setInterval( self.update_interval)
+        self.timer.timeout.connect( self.updateControls)
+         # initialize GUI
+        self.readonly = True
+        self.initGUI()
+        self.layout.addStretch()
+        self.setLayout(self.layout)
+        # update controls and start update timer
+        self.updateControls()
+        self.readonly = False
+        self.timer.start()
+        # start systray timer
+        if self.showsystray.isChecked():
+            self.systrayTimer = QTimer()
+            self.systrayTimer.setInterval( 1000)
+            self.systrayTimer.timeout.connect( self.checkSystray)
+            self.systrayTimer.start()
+        # set geometry
+        self.setFixedSize( self.sizeHint())
+        sr = QApplication.desktop().availableGeometry(-1)
+        self.move( sr.center()-QPoint(self.width()/2,self.height()/2))
+        # check for suid helper
+        if not self.suidhelper:
+            self.status.showMessage(
+                "Could not find suid helper, disabling inputs")
+        # show application
+        if not (self.starthidden.isEnabled() and self.starthidden.isChecked()):
+            self.show()
+    
+    def checkSystray(self):
+        if self.systray:
+            self.systrayTimer.stop()
+            self.systrayTimer = None
+            return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.createSystray()
+
+    def closeEvent(self,ev):
+        if self.systray and self.minimizetray.isChecked():
+            ev.ignore()
+            self.hide()
+        else:
+            ev.accept()
+
+    def find_all(self):
+        result = []
+        name   = 'name'
+        for root, dirs, files in os.walk(self.basepath):
+            if name in files:
+                f = os.path.join(root, name)
+                text = ' '.join(open(f,'r').readlines()).strip()
+                if re.search(r'trackpoint',text,re.I):
+                    result.append(
+                        (text, re.sub(r'/input/input[0-9]*/name', r'', f))
+                    )
+        return result
+
+    def initGUI(self):
+        selectlayout = QHBoxLayout()
+        selectlayout.addWidget(QLabel("Trackpoint"))
+        self.tpcombo = QComboBox()
+        self.tpcombo.addItems([ "%s (%s)" % (n,p) for n,p in self.trackpoints ])
+        selectlayout.addWidget(self.tpcombo)
+        self.layout.addLayout(selectlayout)
+        self.layout.addSpacing(10)
+        
+        actionlayout = QHBoxLayout()
+        defaultbutton = QPushButton("Set Defaults")
+        defaultbutton.clicked.connect(self.setDefaults)
+        actionlayout.addWidget(defaultbutton)
+        loadbutton = QPushButton("Load")
+        loadbutton.clicked.connect(self.loadSettings)
+        actionlayout.addWidget(loadbutton)
+        savebutton = QPushButton("Save")
+        savebutton.clicked.connect(self.saveSettings)
+        actionlayout.addWidget(savebutton)
+        self.layout.addLayout(actionlayout)
+        self.layout.addSpacing(10)
+        
+        self.sliders = []
+        row = 0
+        parambox = QGroupBox("Parameters")
+        paramlayout = QGridLayout()
+        for name,helptext,default in self.parameters:
+            paramlayout.addWidget(QLabel(name), row, 0)
+            label = QLabel()
+            paramlayout.addWidget(label,row,1)
+            slider = QSlider(Qt.Horizontal)
+            slider.setToolTip("%s (default: %d)" % (helptext,default))
+            slider.setRange( 0, 255)
+            slider.setTickPosition(QSlider.TicksBelow)
+            slider.setTickInterval(5)
+            slider.setPageStep(5)
+            slider.setDisabled(True)
+            slider.valueChanged.connect(label.setNum)
+            def sliderPressed(s=slider,l=label):
+                self.timer.stop()
+                l.setStyleSheet("QLabel { color : red; }")
+            slider.sliderPressed.connect( sliderPressed)
+            def sliderReleased(n=name,s=slider, l=label):
+                self.setValue(n,s.value())
+                l.setStyleSheet("QLabel { color : black; }")
+                self.timer.start()
+            slider.sliderReleased.connect(sliderReleased)
+            def actionTriggered(action,n=name,s=slider):
+                if action == 7: return
+                self.setValue(n,s.sliderPosition())
+            slider.actionTriggered.connect(actionTriggered)
+            self.sliders.append((name,slider,default))
+            paramlayout.addWidget(slider,row, 2, 1, 1)
+            row += 1
+        #paramlayout.setColumnStretch(3,1)
+        paramlayout.setHorizontalSpacing(10)
+        parambox.setLayout(paramlayout)
+        self.layout.addWidget(parambox)
+
+        chkboxlayout = QHBoxLayout()
+        self.chkboxes = []
+        row = 0
+        switchbox = QGroupBox("Switches")
+        switchlayout = QGridLayout()
+        for name,helptext,default in self.switches:
+            switchlayout.addWidget(QLabel(name), row, 0)
+            chkbox = QCheckBox()
+            chkbox.setToolTip("%s (default: %d)" % (helptext,default))
+            chkbox.setDisabled(True)
+            chkbox.clicked.connect(lambda x, n=name: self.setValue(n,0 if not x else 1))
+            self.chkboxes.append((name,chkbox,default))
+            switchlayout.addWidget(chkbox,row, 1, 1, 1)
+            row += 1
+        switchlayout.setColumnStretch(row,1)
+        switchlayout.setHorizontalSpacing(10)
+        switchbox.setLayout(switchlayout)
+        chkboxlayout.addWidget(switchbox)
+
+        self.tpcombo.currentIndexChanged.connect(self.updateControls)
+
+        box = QGroupBox("Options")
+        layout = QGridLayout()
+        row = 0
+        layout.addWidget( QLabel("Always On Top"), row, 0)
+        self.alwaysontop = QCheckBox()
+        layout.addWidget(self.alwaysontop, row, 1)
+        row+=1
+        layout.addWidget( QLabel("Show Systray Icon"), row, 0)
+        self.showsystray = QCheckBox()
+        layout.addWidget(self.showsystray, row, 1)
+        row+=1
+        layout.addWidget( QLabel("Minimize To Tray"), row, 0)
+        self.minimizetray = QCheckBox()
+        self.minimizetray.setEnabled(self.showsystray.isChecked())
+        layout.addWidget(self.minimizetray, row, 1)
+        row+=1
+        layout.addWidget( QLabel("Start Hidden"), row, 0)
+        self.starthidden = QCheckBox()
+        self.starthidden.setEnabled(self.showsystray.isChecked())
+        layout.addWidget(self.starthidden, row, 1)
+        
+        layout.setColumnStretch( row, 1)
+        box.setLayout(layout)
+        chkboxlayout.addWidget(box)
+        self.layout.addLayout(chkboxlayout)
+        
+        self.status = QStatusBar(self)
+        self.layout.addWidget(self.status)
+
+        self.loadGeneralSettings()
+        
+        self.alwaysontop.stateChanged.connect( self.toggleAlwaysOnTop)
+        self.showsystray.stateChanged.connect( self.toggleSystray)
+        self.minimizetray.stateChanged.connect(
+            lambda x: self.updateSettings('minimizetray', int(x)))
+        self.starthidden.stateChanged.connect(
+            lambda x: self.updateSettings('starthidden', int(x)))
+
+    def updateSettings(self,name,state):
+        s = QSettings()
+        s.setValue(name,state)
+
+    def readValue(self,name):
+        _ , path = self.trackpoints[self.tpcombo.currentIndex()]
+        f = os.path.join(path,name)
+        try:
+            fp = open(f)
+        except PermissionError:
+            return -1
+        else:
+            with fp:
+                return int(' '.join(fp.readlines()).strip())
+        return -1
+
+    def updateControls(self):
+        for name, s, _ in self.sliders:
+            value = self.readValue(name)
+            if value < 0:
+                s.setValue(0)
+                s.setEnabled(False)
+            else:
+                if value != s.value(): s.setValue(value)
+                if not s.isEnabled(): s.setEnabled(True)
+        for name, c, _ in self.chkboxes:
+            value = self.readValue(name)
+            if value < 0:
+                c.setChecked(False)
+                c.setEnabled(False)
+            else:
+                checked = bool(value)
+                if checked != c.isChecked(): c.setChecked(checked)
+                if not c.isEnabled(): c.setEnabled(True)
+
+    def setDefaults(self):
+        self.timer.stop()
+        for name, s, default in self.sliders:
+            value = self.readValue(name)
+            if value != default:
+                self.setValue(name,default)
+                s.setValue(default)
+                s.setSliderPosition(default)
+        for name, c, default in self.chkboxes:
+            value = self.readValue(name)
+            if value != default:
+                self.setValue(name,default)
+                c.setChecked(default)
+        self.timer.start()
+        
+    def toggleAlwaysOnTop(self,state):
+        self.alwaysontop.setChecked(state)
+        hidden = self.isHidden()
+        flags = self.windowFlags()
+        if state:
+            flags |= Qt.WindowStaysOnTopHint
+        else:
+            flags &= ~Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        if not hidden: self.show()
+        self.updateSettings("alwaysontop", int(state))
+    
+    def createSystray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        if self.systray:
+            self.destroySystray()
+        self.systray = QSystemTrayIcon()
+        pix = QPixmap(22,22)
+        pix.fill(Qt.transparent)
+        self.systray.setIcon(QApplication.windowIcon())
+        self.systray.activated.connect( self.systrayActivated)
+        m = QMenu()
+        m.addAction("Quit", QApplication.quit)
+        self.systray.setContextMenu(m)
+        self.systray.show()
+        self.systrayCycle = 0
+
+    def destroySystray(self):
+        if not self.systray:
+            return
+        sip.delete(self.systray)
+        self.systray = None
+
+    def toggleSystray(self,state):
+        self.showsystray.setChecked(state)
+        self.minimizetray.setEnabled(state)
+        self.starthidden.setEnabled(state)
+        if state:
+            self.createSystray()
+        else:
+            self.destroySystray()
+        self.updateSettings("systray", int(state))
+
+    def systrayActivated(self,reason):
+        if reason == QSystemTrayIcon.Trigger:
+            if self.isHidden():
+                self.show()
+            else:
+                self.hide()
+    
+    def loadGeneralSettings(self):
+        self.status.showMessage("Loading general settings", self.msgtimeout)
+        s = QSettings()
+        self.fgColor = QColor(s.value("fgColor", QColor("#33b0dc")))
+        self.bgColor = QColor(s.value("bgColor", QColor("#144556")))
+        self.toggleAlwaysOnTop( int(s.value("alwaysontop", 0)))
+        self.toggleSystray( int(s.value("systray", 0)))
+        self.minimizetray.setChecked( int(s.value("minimizetray", 0)))
+        self.starthidden.setChecked( int(s.value("starthidden", 0)))
+        
+    @pyqtSlot(str)
+    def setValue(self,control,value):
+        if self.readonly: return
+        if not self.suidhelper: return
+        _, path = self.trackpoints[self.tpcombo.currentIndex()]
+        args = [ self.suidhelper,
+                 "-p", os.path.join(path,control),
+                 "-v", str(value)]
+        try:
+            subprocess.check_output(args)
+        except subprocess.CalledProcessError as err:
+            if err.returncode != 0:
+                self.status.showMessage(str(err.output).strip())
+                return
+
+    def loadSettings(self):
+        self.timer.stop()
+        self.status.showMessage("Loading settings", self.msgtimeout)
+        settings = QSettings()
+        for name,s,default in self.sliders:
+            self.status.showMessage("Loading %s" % name, self.msgtimeout)
+            value = int(settings.value("Values/%s" % name,default))
+            if value != s.value():
+                s.setValue(value)
+                self.setValue(name,value)
+        for name,c,default in self.chkboxes:
+            self.status.showMessage("Loading %s" % name, self.msgtimeout)
+            value = bool(int(settings.value("Values/%s" % name,default)))
+            if value != c.isChecked():
+                c.setChecked(value)
+                self.setValue(name,1 if value else 0)
+        self.status.showMessage("All settings loaded", self.msgtimeout)
+        self.timer.start()
+
+    def saveSettings(self):
+        self.status.showMessage("Saving settings", self.msgtimeout)
+        settings = QSettings()
+        for name,s,default in self.sliders:
+            settings.setValue("Values/%s" % name,int(s.value()))
+        for name,c,default in self.chkboxes:
+            settings.setValue("Values/%s" % name,1 if c.isChecked() else 0)
+        self.status.showMessage("All settings saved", self.msgtimeout)
+        
+def getDataFile(fn):
+    datapaths = [ '/usr/local/share', '/usr/share' ]
+    for p in datapaths:
+        path = os.path.join( p,QApplication.applicationName(),fn)
+        if os.path.exists( path):
+            return path
+    return fn
+
+def detach():
+    stdin  = '/dev/null'
+    stdout = '/dev/null'
+    stderr = '/dev/null'
+    
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit first parent
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+        sys.exit(1)
+        
+    # decouple from parent environment
+    os.chdir("/")
+    os.setsid()
+    os.umask(0)
+        
+    # do second fork
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit from second parent
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+        sys.exit(1)
+        
+    # redirect standard file descriptors
+    sys.stdout.flush()
+    sys.stderr.flush()
+    si = open(stdin, 'r')
+    so = open(stdout, 'a+')
+    se = open(stderr, 'a+')
+    os.dup2(si.fileno(), sys.stdin.fileno())
+    os.dup2(so.fileno(), sys.stdout.fileno())
+    os.dup2(se.fileno(), sys.stderr.fileno())
+
+def parseCommandLine():
+    ret = {}
+    parser = argparse.ArgumentParser(
+        description='trackpoint-control')
+    parser.add_argument( '-d', '--daemon',
+                         help='run as daemon', action="store_true")
+    args = parser.parse_args()
+    
+    # detach immediately if run as daemon
+    if args.daemon: detach()
+    
+    ret['daemon'] = args.daemon
+
+    return ret
+
+def main():
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    argdict = parseCommandLine()
+    a = QApplication(sys.argv)
+    a.setOrganizationName("mechnich")
+    a.setApplicationName( "trackpoint-control")
+    a.setWindowIcon(QIcon(getDataFile("trackpoint.png")))
+    i = TrackpointControl()
+    return a.exec_()
+
+if __name__ == "__main__":
+    main()
